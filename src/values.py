@@ -40,6 +40,9 @@ def parse_values_input(raw_text, value_type):
 
     for token in tokens:
         expanded = expand_logspace_token(token, value_type)
+        if expanded == [] and is_logspace_token(token):
+            return [], (f"'{token}' is not valid: use logspace(start, end, count) "
+                        "with a positive start and end and a whole count.")
         if expanded is None:
             expanded = expand_range_token(token, value_type)
         if expanded is None:
@@ -53,48 +56,53 @@ def parse_values_input(raw_text, value_type):
     return values, ""
 
 
+LOGSPACE = "logspace("
+
+
+def is_logspace_token(token):
+    normalized = token.replace(" ", "")
+    return normalized.startswith(LOGSPACE) and normalized.endswith(")")
+
+
 def expand_logspace_token(token, value_type):
-    if value_type not in ("int", "float"):
+    """logspace(start, end, count) -> `count` values spaced geometrically.
+
+    Returns None when the token is not a logspace call at all, and an empty
+    list when it is one but cannot be read.
+    """
+    if value_type not in ("int", "float") or not is_logspace_token(token):
         return None
 
     normalized = token.replace(" ", "")
-    if not normalized.startswith("logspace(") or not normalized.endswith(")"):
-        return None
-
-    args_text = normalized[len("logspace("):-1]
-    parts = args_text.split(",")
+    parts = normalized[len(LOGSPACE):-1].split(",")
     if len(parts) != 3 or any(not part for part in parts):
         return []
 
     try:
         start = float(parts[0])
-        points_float = float(parts[1])
-        end = float(parts[2])
+        end = float(parts[1])
+        count_value = float(parts[2])
     except ValueError:
         return []
 
+    # A geometric progression has no way through zero or a sign change.
     if start <= 0 or end <= 0:
         return []
 
-    points = int(round(points_float))
-    if abs(points_float - points) > 1e-12 or points <= 0:
+    count = int(round(count_value))
+    if abs(count_value - count) > 1e-12 or count <= 0:
         return []
 
-    if points == 1:
-        values = [start]
-        return values if value_type == "float" else [int(round(start))]
+    if count == 1:
+        return [start] if value_type == "float" else [int(round(start))]
 
     log_start = math.log10(start)
     log_end = math.log10(end)
     values = []
-    for idx in range(points):
-        t = idx / (points - 1)
-        exp = log_start + t * (log_end - log_start)
-        value = 10 ** exp
-        if value_type == "float":
-            values.append(value)
-        else:
-            values.append(int(round(value)))
+    for index in range(count):
+        fraction = index / (count - 1)
+        value = 10 ** (log_start + fraction * (log_end - log_start))
+        values.append(value if value_type == "float" else int(round(value)))
 
     return values
 
@@ -168,9 +176,11 @@ def parse_single_value(token, value_type):
 
 
 def format_numeric_value(value):
-    rounded_int = round(value)
-    if abs(value - rounded_int) < 1e-12:
-        return str(rounded_int)
+    # Whether a value is a whole number is a question about the value, not
+    # about its distance from zero: an absolute tolerance here flattens every
+    # small magnitude, turning a 1e-16 timestep into 0.
+    if float(value).is_integer() and abs(value) < 1e16:
+        return str(int(value))
     return f"{value:.12g}"
 
 

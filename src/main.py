@@ -2,16 +2,18 @@ import multiprocessing
 import os
 import sys
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QActionGroup
 from PySide6.QtWidgets import *
 
+import encore_input
 import geo
 import theme
+import tools
 from project import Project, ProjectError, SUFFIX as PROJECT_SUFFIX
 from values import format_value_for_table, parse_values_input
 from widgets import (CollapsibleSection, EnterKeyButton, GeoPanel, MaterialsPanel,
-                     ParameterGrid)
+                     ParameterGrid, ToolPanel)
 
 
 class Workbench(QMainWindow):
@@ -20,12 +22,28 @@ class Workbench(QMainWindow):
     def __init__(self):
         super().__init__()
         self.geo_data = None
+        self.variables = {}
+        self.tools = []
         self.project = None
         self._loading_project = False
 
-        project_menu = self.menuBar().addMenu("Project")
-        project_menu.addAction("New Project...", self.new_project)
-        project_menu.addAction("Open Project...", self.open_project)
+        # Menus are held on the window: the menu bar does not keep the Python
+        # side alive, and a collected menu takes its actions with it.
+        self.project_menu = self.menuBar().addMenu("Project")
+        self.project_menu.addAction("New Project...", self.new_project)
+        self.project_menu.addAction("Open Project...", self.open_project)
+
+        # Between Project and View; build_theme_menu adds View after this.
+        self.tool_menu = self.menuBar().addMenu("Tool")
+        self.add_menu = self.tool_menu.addMenu("Add")
+        for tool_type, definition in tools.TOOL_TYPES.items():
+            action = self.add_menu.addAction(definition["label"])
+            action.setStatusTip(definition["description"])
+            action.triggered.connect(lambda checked=False, t=tool_type: self.add_tool(t))
+
+        # Filled in by rebuild_tool_sections, since it lists the tools by name.
+        self.remove_menu = self.tool_menu.addMenu("Remove")
+        self.rebuild_remove_menu()
 
         self.settings = QSettings("Encore", "Workbench")
         self.theme_name = self.settings.value("theme", theme.SYSTEM_THEME)
@@ -51,7 +69,8 @@ class Workbench(QMainWindow):
         self.variable_input.setMinimumWidth(200)
         self.variable_input.setPlaceholderText("Variable")
         self.variable_input.currentIndexChanged.connect(self.on_variable_selection_changed)
-        self.values_input = QLineEdit(placeholderText="Values (0.01, 0.02 or 0.01:0.01:0.05)")
+        self.values_input = QLineEdit(
+            placeholderText="Values (0.01, 0.02 or 0.01:0.01:0.05 or logspace(1e3,1e5,10))")
         self.values_input.setMinimumWidth(260)
         self.values_input.setEnabled(False)
         self.add_btn = EnterKeyButton("Add Variable")
@@ -77,30 +96,34 @@ class Workbench(QMainWindow):
 
         self.materials_section = CollapsibleSection("Materials", self.materials_panel)
         self.geo_section = CollapsibleSection("Geometry", self.geo_panel)
+        self.tool_sections = []
 
         # Each section takes exactly the height its content needs; the trailing
         # stretch absorbs the rest, so folding one leaves the others in place
         # and nothing floats in the middle of the column.
+        self.column_layout = QVBoxLayout()
+        self.column_layout.setContentsMargins(0, 0, 0, 0)
+        self.column_layout.setSpacing(theme.SPACING_MD)
+        self.column_layout.addWidget(self.materials_section)
+        self.column_layout.addWidget(self.geo_section)
+        self.column_layout.addStretch(1)
         self.sections = [self.materials_section, self.geo_section]
+
         column = QWidget()
-        column_layout = QVBoxLayout(column)
-        column_layout.setContentsMargins(0, 0, 0, 0)
-        column_layout.setSpacing(theme.SPACING_MD)
-        for section in self.sections:
-            column_layout.addWidget(section)
-        column_layout.addStretch(1)
+        column.setLayout(self.column_layout)
 
         # The column is as tall as its content, so it scrolls rather than
         # squeezing the tables when there is more than the window can show.
-        project_column = QScrollArea()
-        project_column.setWidget(column)
-        project_column.setWidgetResizable(True)
-        project_column.setFrameShape(QFrame.NoFrame)
-        project_column.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.project_column = QScrollArea()
+        self.project_column.setWidget(column)
+        self.project_column.setWidgetResizable(True)
+        self.project_column.setFrameShape(QFrame.NoFrame)
+        self.project_column.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        project_column = self.project_column
 
         self.grid = ParameterGrid()
         self.grid.rowExportRequested.connect(self.generate_row_mesh)
-        self.grid.gridChanged.connect(self.save_project)
+        self.grid.gridChanged.connect(self.on_grid_changed)
 
         sweep_column = QWidget()
         sweep_layout = QVBoxLayout(sweep_column)
@@ -114,7 +137,8 @@ class Workbench(QMainWindow):
         splitter.addWidget(sweep_column)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 680])
+        # The tool panels carry long setting names, so the column starts wider.
+        splitter.setSizes([380, 620])
         layout.addWidget(splitter)
 
         self.resize(1100, 620)
@@ -163,6 +187,7 @@ class Workbench(QMainWindow):
         try:
             materials = [project.resolve(path) for path in project.get("materials", [])]
             self.materials_panel.set_paths(materials, show_errors=False)
+            self.set_tools(project.get("tools", []))
             self.geo_panel.set_materials(self.material_names())
 
             geometry = project.resolve(project.get("geometry", ""))
@@ -170,7 +195,8 @@ class Workbench(QMainWindow):
                 # Loading clears assignments and the sweep, so both are put
                 # back afterwards.
                 self.geo_panel.set_assignments(project.get("volumes", {}))
-                self.restore_sweep(project)
+            self.refresh_variables()
+            self.restore_sweep(project)
         finally:
             self._loading_project = False
 
@@ -185,6 +211,7 @@ class Workbench(QMainWindow):
         self.project.set("materials",
                          [self.project.relative(path) for path in self.materials_panel.paths()])
         self.project.set("volumes", dict(self.geo_panel.assignments))
+        self.project.set("tools", self.tools)
         self.project.set("sweep", self.grid.parameters)
         self.project.set("hidden_rows", sorted(self.grid.hidden_row_keys))
         try:
@@ -192,13 +219,24 @@ class Workbench(QMainWindow):
         except ProjectError as exc:
             QMessageBox.warning(self, "Save Failed", str(exc))
 
+    def set_tools(self, saved):
+        """Replace the tool list from a project. No signal: this is the load."""
+        self.tools = [
+            {"type": tool["type"],
+             "name": str(tool.get("name") or tool["type"]),
+             "values": dict(tool.get("values") or {})}
+            for tool in saved
+            if isinstance(tool, dict) and tool.get("type") in tools.TOOL_TYPES
+        ]
+        self.rebuild_tool_sections()
+
     def restore_sweep(self, project):
         """Put back the saved sweep columns, minus any the geometry has lost."""
         saved = project.get("sweep", [])
         if not isinstance(saved, list):
             return
 
-        known = {constant["name"] for constant in self.geo_data["constants"]} if self.geo_data else set()
+        known = set(self.variables)
         kept, dropped = [], []
         for param in saved:
             if not isinstance(param, dict) or not param.get("name") or not param.get("values"):
@@ -211,16 +249,17 @@ class Workbench(QMainWindow):
             # Keeping them would be worse than dropping them: gmsh ignores a
             # constant the .geo does not declare, so every row of that sweep
             # would quietly mesh identically.
-            names = ", ".join(geo.short_name(param["name"]) for param in dropped)
+            names = ", ".join(param.get("label") or param["name"] for param in dropped)
             QMessageBox.information(
                 self, "Sweep Variables Dropped",
-                f"{os.path.basename(self.geo_data['path'])} no longer declares "
-                f"these constants, so they were removed from the sweep:\n\n{names}")
+                "These are no longer offered by the geometry or the project's "
+                f"tools, so they were removed from the sweep:\n\n{names}")
 
     def build_theme_menu(self):
         themes = theme.available_themes()
-        view_menu = self.menuBar().addMenu("View")
-        theme_menu = view_menu.addMenu("Theme")
+        self.view_menu = self.menuBar().addMenu("View")
+        self.theme_menu = self.view_menu.addMenu("Theme")
+        theme_menu = self.theme_menu
 
         group = QActionGroup(self)
         group.setExclusive(True)
@@ -251,11 +290,18 @@ class Workbench(QMainWindow):
         name = self.project.name if self.project else "no project"
         self.setWindowTitle(f"Encore Workbench - {name}")
 
+    def on_grid_changed(self):
+        self.mark_swept_fields()
+        self.save_project()
+
     def material_names(self):
         return [material["name"] for material in self.materials_panel.materials]
 
     def on_materials_changed(self, paths):
         self.geo_panel.set_materials(self.material_names())
+        for section in self.tool_sections:
+            section.content.set_materials(self.material_names())
+        self.schedule_column_fit()
         self.save_project()
 
     def on_assignments_changed(self, assignments):
@@ -271,50 +317,203 @@ class Workbench(QMainWindow):
         # meaningless: start the table over.
         self.grid.set_state([])
 
-        self.variable_input.clear()
-        for constant in geo_data["constants"]:
-            if constant["read_only"]:
-                continue
-            self.variable_input.addItem(geo.short_name(constant["name"]), constant["name"])
-
-        has_constants = self.variable_input.count() > 0
-        self.variable_input.setEnabled(has_constants)
-        self.values_input.setEnabled(has_constants)
-        self.add_btn.setEnabled(has_constants)
-        self.generate_btn.setEnabled(True)
-        self.on_variable_selection_changed()
+        self.refresh_variables()
+        self.schedule_column_fit()
         self.save_project()
 
+    def refresh_variables(self):
+        """Rebuild what the sweep table can vary: geometry constants and tool settings."""
+        self.variables = {}
+
+        if self.geo_data:
+            for constant in self.geo_data["constants"]:
+                if constant["read_only"]:
+                    continue
+                self.variables[constant["name"]] = {
+                    "label": geo.short_name(constant["name"]),
+                    "value": constant["value"],
+                    "value_type": constant["value_type"],
+                    "geometry": True,
+                }
+
+        for tool in self.tools:
+            for field in tools.fields(tool["type"]):
+                self.variables[tools.variable_name(tool, field["key"])] = {
+                    "label": f"{tool['name']}.{field['key']}",
+                    "value": field["default"],
+                    "value_type": field["value_type"],
+                    "geometry": False,
+                }
+
+        current = self.variable_input.currentData()
+        self.variable_input.blockSignals(True)
+        self.variable_input.clear()
+        for name, variable in self.variables.items():
+            self.variable_input.addItem(variable["label"], name)
+        if current in self.variables:
+            self.variable_input.setCurrentIndex(self.variable_input.findData(current))
+        self.variable_input.blockSignals(False)
+
+        enabled = bool(self.variables)
+        self.variable_input.setEnabled(enabled)
+        self.values_input.setEnabled(enabled)
+        self.add_btn.setEnabled(enabled)
+        # A geometry is optional -- a memc run needs no device -- but there is
+        # nothing to write without a tool.
+        self.generate_btn.setEnabled(bool(self.tools))
+        self.on_variable_selection_changed()
+
+    def geometry_names(self):
+        return {name for name, variable in self.variables.items() if variable["geometry"]}
+
+    def schedule_column_fit(self):
+        """Refit once the tables have worked out their own widths."""
+        QTimer.singleShot(0, self.fit_column_width)
+
+    def fit_column_width(self):
+        """Ask the splitter for the width the panels need.
+
+        A QScrollArea's own hint ignores its contents, so without this the
+        column collapses to something narrower than the tables inside it and
+        clips them -- there is no horizontal scrollbar to fall back on.
+        """
+        inner = self.project_column.widget()
+        width = inner.minimumSizeHint().width() + 2
+        if self.project_column.verticalScrollBar().isVisible():
+            width += self.project_column.verticalScrollBar().sizeHint().width()
+        self.project_column.setMinimumWidth(min(width, 480))
+
+    def add_tool(self, tool_type):
+        self.tools.append(tools.new_tool(tool_type, [t["name"] for t in self.tools]))
+        self.on_tools_changed()
+
+    def remove_tool(self, tool):
+        if tool in self.tools:
+            self.tools.remove(tool)
+            self.on_tools_changed()
+
+    def on_tools_changed(self):
+        self.rebuild_tool_sections()
+        self.refresh_variables()
+        self.prune_sweep()
+        self.save_project()
+
+    def rename_tool(self, tool, new_name):
+        """Rename a tool, carrying its sweep columns with it.
+
+        The name is the prefix of every variable the tool offers, so a rename
+        that did not migrate them would leave the columns pointing at a tool
+        that no longer exists, and prune_sweep would quietly drop them.
+        """
+        old_name = tool["name"]
+        new_name = self.sanitize_name_token(new_name) if new_name else ""
+
+        if not new_name or new_name == old_name:
+            self.rebuild_tool_sections()
+            return
+
+        if new_name in [other["name"] for other in self.tools if other is not tool]:
+            QMessageBox.warning(self, "Name Taken",
+                                f"Another tool is already called '{new_name}'.")
+            self.rebuild_tool_sections()
+            return
+
+        tool["name"] = new_name
+        old_prefix, new_prefix = f"{old_name}.", f"{new_name}."
+
+        parameters = []
+        for param in self.grid.parameters:
+            if param["name"].startswith(old_prefix):
+                key = param["name"][len(old_prefix):]
+                param = dict(param, name=new_prefix + key, label=new_prefix + key)
+            parameters.append(param)
+        hidden = {key.replace(old_prefix, new_prefix) for key in self.grid.hidden_row_keys}
+        self.grid.set_state(parameters, hidden)
+
+        self.rebuild_tool_sections()
+        self.refresh_variables()
+        self.save_project()
+
+    def on_tool_values_changed(self, tool):
+        self.refresh_variables()
+        self.save_project()
+
+    def rebuild_tool_sections(self):
+        """One collapsible section per tool, after the fixed two."""
+        for section in self.tool_sections:
+            self.column_layout.removeWidget(section)
+            section.setParent(None)
+            section.deleteLater()
+        self.tool_sections = []
+
+        for tool in self.tools:
+            panel = ToolPanel(tool)
+            panel.set_materials(self.material_names())
+            panel.valuesChanged.connect(self.on_tool_values_changed)
+            panel.renameRequested.connect(self.rename_tool)
+            panel.removeRequested.connect(self.remove_tool)
+            section = CollapsibleSection(f"{tools.label(tool['type'])}: {tool['name']}", panel)
+            # Before the trailing stretch, which keeps the column packed up top.
+            self.column_layout.insertWidget(self.column_layout.count() - 1, section)
+            self.tool_sections.append(section)
+
+        self.sections = [self.materials_section, self.geo_section] + self.tool_sections
+        self.rebuild_remove_menu()
+        self.mark_swept_fields()
+        self.schedule_column_fit()
+
+    def rebuild_remove_menu(self):
+        self.remove_menu.clear()
+        self.remove_menu.setEnabled(bool(self.tools))
+        for tool in self.tools:
+            action = self.remove_menu.addAction(tool["name"])
+            action.triggered.connect(lambda checked=False, t=tool: self.remove_tool(t))
+
+    def mark_swept_fields(self):
+        """Tell each tool panel which of its fields the sweep table varies."""
+        swept = {param["name"] for param in self.grid.parameters}
+        for tool, section in zip(self.tools, self.tool_sections):
+            keys = [field["key"] for field in tools.fields(tool["type"])
+                    if tools.variable_name(tool, field["key"]) in swept]
+            section.content.set_swept(keys)
+
+    def prune_sweep(self):
+        """Drop sweep columns whose variable no longer exists.
+
+        Removing a tool takes its settings with it; leaving the column would
+        sweep a name nothing answers to.
+        """
+        kept = [param for param in self.grid.parameters if param["name"] in self.variables]
+        if len(kept) != len(self.grid.parameters):
+            self.grid.set_state(kept, self.grid.hidden_row_keys)
+
     def constant(self, name):
-        for constant in self.geo_data["constants"]:
-            if constant["name"] == name:
-                return constant
-        return None
+        return self.variables.get(name)
 
     def on_variable_selection_changed(self, index=None):
-        constant = self.constant(self.variable_input.currentData())
+        constant = self.variables.get(self.variable_input.currentData())
         if constant is None:
             self.values_input.setPlaceholderText("Values")
             return
 
         current = format_value_for_table(constant["value"])
-        self.values_input.setPlaceholderText(f"Values (default {current})")
+        if constant["value_type"] in ("int", "float"):
+            self.values_input.setPlaceholderText(
+                f"Values (default {current}; a, b or start:step:end or logspace(start,end,count))")
+        else:
+            self.values_input.setPlaceholderText(f"Values (default {current})")
 
     # --- Sweep -------------------------------------------------------------
 
     def add_variable(self):
-        if self.geo_data is None:
-            QMessageBox.information(self, "Select Geometry", "Please select a .geo file first.")
-            return
-
         name = self.variable_input.currentData()
-        constant = self.constant(name)
+        constant = self.variables.get(name)
         if constant is None:
             return
 
         if self.grid.has_parameter(name):
             QMessageBox.information(self, "Already Added",
-                                    f"'{geo.short_name(name)}' is already in the table.")
+                                    f"'{constant['label']}' is already in the table.")
             return
 
         value_type = constant["value_type"]
@@ -332,71 +531,185 @@ class Workbench(QMainWindow):
             values = [constant["value"]]
 
         self.values_input.clear()
-        self.grid.add_parameter(name, values, value_type, label=geo.short_name(name))
+        self.grid.add_parameter(name, values, value_type, label=constant["label"])
 
     # --- Meshing -----------------------------------------------------------
 
-    def generate_row_mesh(self, row_data):
+    def geometry_values(self, row_data):
+        """Only the geometry's own constants: a tool's settings mean nothing to gmsh."""
+        names = self.geometry_names()
+        return {name: value for name, value in row_data.items() if name in names}
+
+    def contact_names(self):
+        """Physical groups below the model's dimension: the device's contacts."""
         if self.geo_data is None:
+            return []
+
+        dimension = self.geo_data["dimension"]
+        return [group["name"] for group in self.geo_data["physical_groups"]
+                if group["dimension"] < dimension and group["name"]]
+
+    def device_name(self):
+        return os.path.splitext(os.path.basename(self.geo_data["path"]))[0] if self.geo_data else "device"
+
+    def varying_parameters(self):
+        """Sweep columns with more than one value.
+
+        A column pinned to a single value is the same in every row, so naming
+        anything after it only adds noise.
+        """
+        return [param for param in self.grid.parameters if len(param["values"]) > 1]
+
+    def row_label(self, row_data):
+        """What distinguishes this row from the others, for naming its output."""
+        parts = []
+        for param in self.varying_parameters():
+            name = param["name"]
+            if name in row_data:
+                parts.append(f"{param.get('label') or name}"
+                             f"{format_value_for_table(row_data[name])}")
+        return "_".join(self.sanitize_name_token(part) for part in parts if part)
+
+    def sim_nodes(self, row_data, suffix=""):
+        """The `sim:` entries for one row, or raise if a tool is underspecified."""
+        nodes = []
+        for tool in self.tools:
+            values = tools.tool_values(tool, row_data)
+            missing = tools.missing_required(tool, values)
+            if missing:
+                raise encore_input.InputError(
+                    f"{tool['name']} has no value for: {', '.join(missing)}.\n\n"
+                    "Add each as a sweep variable to give it one.")
+
+            node = tools.build_node(tool, values)
+            if suffix:
+                # Encore names each run's output after this, so every entry in
+                # the sweep needs its own; it nests output the way Encore's own
+                # bias and efield sweeps do.
+                body = node[tool["type"]]
+                body["name"] = f"{tool['name']}/{suffix}"
+            nodes.append(node)
+        return nodes
+
+    def build_input(self, row_data, mesh_path, input_path):
+        """The input document for one row, naming the mesh relative to itself."""
+        materials = [{"name": m["name"], "path": m["path"]}
+                     for m in self.materials_panel.materials]
+
+        device = None
+        if mesh_path:
+            device = encore_input.build_device(
+                self.device_name(),
+                os.path.relpath(mesh_path, os.path.dirname(input_path)),
+                self.geo_panel.assignments, self.contact_names(), materials)
+
+        return encore_input.build_document(materials, self.sim_nodes(row_data), [device])
+
+    def builds_device(self):
+        """Whether this project describes a device at all.
+
+        A memc run works off a material and fields; it needs no mesh, so a
+        project with no geometry, or none bound to a material, still generates.
+        """
+        return bool(self.geo_data and self.geo_panel.assignments)
+
+    def write_run(self, row_data, directory, mesh_path):
+        """Write one row's input, and its mesh if there is a device."""
+        result = None
+        if self.builds_device():
+            result = geo.generate_mesh(self.geo_data["path"],
+                                       self.geometry_values(row_data), mesh_path)
+        else:
+            mesh_path = None
+
+        input_path = os.path.join(directory, "encore.yaml")
+        encore_input.write_document(input_path, self.build_input(row_data, mesh_path, input_path))
+        return result
+
+    def generate_row_mesh(self, row_data):
+        if not self.tools:
+            QMessageBox.information(self, "No Tools", "Add a tool before generating.")
             return
 
-        default_name = f"{self.mesh_name(row_data)}.msh"
-        path, _ = QFileDialog.getSaveFileName(self, "Write Mesh", default_name, "Gmsh Mesh (*.msh)")
-        if not path:
+        directory = QFileDialog.getExistingDirectory(self, "Select Run Folder")
+        if not directory:
             return
-
-        if not path.lower().endswith(".msh"):
-            path = f"{path}.msh"
 
         try:
-            result = geo.generate_mesh(self.geo_data["path"], row_data, path)
-        except geo.GeoError as exc:
-            QMessageBox.warning(self, "Meshing Failed", f"Could not mesh this geometry:\n\n{exc}")
+            result = self.write_run(row_data, directory, os.path.join(directory, "mesh.msh"))
+        except (geo.GeoError, encore_input.InputError) as exc:
+            QMessageBox.warning(self, "Generate Failed", str(exc))
             return
 
-        QMessageBox.information(
-            self, "Mesh Written",
-            f"{os.path.basename(result['path'])}\n"
-            f"{result['nodes']} nodes, {result['elements']} elements")
+        written = "encore.yaml and mesh.msh" if result else "encore.yaml"
+        detail = f"\n{result['nodes']} nodes, {result['elements']} elements" if result else ""
+        QMessageBox.information(self, "Run Written", f"{directory}\n\n{written}{detail}")
 
     def generate_all_meshes(self):
-        if self.geo_data is None:
-            return
-
         rows = self.grid.rows()
         if not rows:
-            QMessageBox.information(self, "No Rows", "There are no sweep points to mesh.")
+            QMessageBox.information(self, "No Rows", "There are no sweep points to run.")
+            return
+
+        if not self.tools:
+            QMessageBox.information(self, "No Tools", "Add a tool before generating.")
             return
 
         directory = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if not directory:
             return
 
-        progress = QProgressDialog(f"Meshing {len(rows)} geometries...", "Cancel", 0, len(rows), self)
+        progress = QProgressDialog(f"Meshing {len(rows)} sweep points...", "Cancel",
+                                   0, len(rows), self)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
 
-        written = 0
-        for index, row_data in enumerate(rows):
-            progress.setValue(index)
-            progress.setLabelText(f"Meshing {index + 1} of {len(rows)}...")
-            QApplication.processEvents()
-            if progress.wasCanceled():
-                break
+        materials = [{"name": m["name"], "path": m["path"]}
+                     for m in self.materials_panel.materials]
 
-            path = self.unique_mesh_path(directory, self.mesh_name(row_data))
-            try:
-                geo.generate_mesh(self.geo_data["path"], row_data, path)
-            except geo.GeoError as exc:
-                progress.close()
-                QMessageBox.warning(
-                    self, "Meshing Failed",
-                    f"Stopped after {written} mesh(es).\n\n{os.path.basename(path)}:\n{exc}")
-                return
-            written += 1
+        # One document for the whole sweep: Encore builds the materials and
+        # devices once and runs every `sim:` entry against them. Rows differing
+        # only in a tool's settings share a mesh, and so share a device.
+        # With no geometry, or none bound to a material, there is no device to
+        # build and nothing would reference a mesh, so none is written.
+        with_device = self.builds_device()
 
-        progress.setValue(len(rows))
-        QMessageBox.information(self, "Meshing Complete", f"Wrote {written} mesh file(s).")
+        devices = {}
+        sims = []
+        try:
+            for index, row_data in enumerate(rows):
+                progress.setValue(index)
+                progress.setLabelText(f"Sweep point {index + 1} of {len(rows)}...")
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    return
+
+                mesh_name = self.mesh_name(row_data)
+                if with_device and mesh_name not in devices:
+                    mesh_path = os.path.join(directory, "meshes", f"{mesh_name}.msh")
+                    geo.generate_mesh(self.geo_data["path"],
+                                      self.geometry_values(row_data), mesh_path)
+                    devices[mesh_name] = encore_input.build_device(
+                        self.device_name() if len(rows) == 1 else mesh_name,
+                        os.path.relpath(mesh_path, directory),
+                        self.geo_panel.assignments, self.contact_names(), materials)
+
+                sims.extend(self.sim_nodes(row_data, suffix=self.row_label(row_data)))
+
+            document = encore_input.build_document(materials, sims, devices.values())
+            encore_input.write_document(os.path.join(directory, "encore.yaml"), document)
+        except (geo.GeoError, encore_input.InputError) as exc:
+            progress.close()
+            QMessageBox.warning(self, "Generate Failed", str(exc))
+            return
+        finally:
+            progress.setValue(len(rows))
+
+        meshes = len(devices)
+        QMessageBox.information(
+            self, "Input Written",
+            f"encore.yaml with {len(sims)} sim entr{'y' if len(sims) == 1 else 'ies'}"
+            f"{f' and {meshes} mesh(es)' if meshes else ''} under\n{directory}")
 
     def unique_mesh_path(self, directory, base_name):
         candidate = os.path.join(directory, f"{base_name}.msh")
@@ -410,11 +723,24 @@ class Workbench(QMainWindow):
                 return candidate
             idx += 1
 
-    def mesh_name(self, row_data):
-        parts = [os.path.splitext(os.path.basename(self.geo_data["path"]))[0]]
+    def run_name(self, row_data):
+        parts = [self.device_name()]
         for param in self.grid.parameters:
             name = param["name"]
             if name in row_data:
+                parts.append(f"{param.get('label') or name}{format_value_for_table(row_data[name])}")
+
+        return "_".join(self.sanitize_name_token(part) for part in parts if part)
+
+    def mesh_name(self, row_data):
+        if self.geo_data is None:
+            return ""
+
+        parts = [os.path.splitext(os.path.basename(self.geo_data["path"]))[0]]
+        names = self.geometry_names()
+        for param in self.varying_parameters():
+            name = param["name"]
+            if name in row_data and name in names:
                 value_text = format_value_for_table(row_data[name])
                 parts.append(f"{geo.short_name(name)}{value_text}")
 

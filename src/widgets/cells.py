@@ -1,5 +1,8 @@
 from PySide6.QtWidgets import QHeaderView, QTableWidget
 
+# A panel should not be able to push the whole column arbitrarily wide.
+MAX_REQUESTED_WIDTH = 460
+
 """Helpers for sizing tables and for tables that put widgets in their cells."""
 
 
@@ -21,20 +24,26 @@ def clear_cell_widgets(table, column):
 
 
 def fit_height(table):
-    """Cap a table at the height of its own contents.
+    """Fix a table at the height of its own contents.
 
-    A maximum rather than a fixed height: the table still shrinks, and shows a
-    scrollbar, when the panel is too small for all its rows.
+    Fixed rather than capped: inside a scroll area a mere maximum lets the
+    layout squeeze the table, cutting a row in half, when what should give is
+    the column -- by scrolling.
     """
     height = table.horizontalHeader().height() + 2 * table.frameWidth()
     for row in range(table.rowCount()):
         height += table.rowHeight(row)
 
-    scrollbar = table.horizontalScrollBar()
-    if scrollbar.isVisible():
-        height += scrollbar.height()
+    # A horizontal scrollbar takes height of its own. Asking whether it is
+    # visible is too early here -- the layout has not run -- so compare the
+    # columns against the space they have.
+    needed = sum(table.columnWidth(column) for column in range(table.columnCount()))
+    if table.verticalHeader().isVisible():
+        needed += table.verticalHeader().width()
+    if needed > table.viewport().width():
+        height += table.horizontalScrollBar().sizeHint().height()
 
-    table.setMaximumHeight(height)
+    table.setFixedHeight(height)
 
 
 def fit_columns(table):
@@ -66,6 +75,13 @@ def fit_columns(table):
 
     for column, width in enumerate(widths):
         table.setColumnWidth(column, width)
+
+    # Ask for the width the contents actually need, so a panel in a splitter
+    # is given room instead of collapsing to a hint that clips its columns.
+    wanted = sum(needed) + 2 * table.frameWidth()
+    if table.verticalHeader().isVisible():
+        wanted += table.verticalHeader().width()
+    table.setMinimumWidth(min(wanted, MAX_REQUESTED_WIDTH))
 
 
 class FittedTable(QTableWidget):

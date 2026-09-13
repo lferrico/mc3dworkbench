@@ -1,5 +1,8 @@
 __pycache__/
+.vscode
+*.json
+*.yaml
+build/
+dist/
 input_files/
-template*.json
-*.encore.json
-encore*
+pyinstaller_build.log

@@ -1,18 +1,21 @@
-geometry: pn_junction.geo
-materials: []
+materials:
+- /home/lerrico/dev/Encore/Data/Materials/Silicon/Silicon.yaml
 volumes: {}
+tools:
+- type: memc
+  name: Silicon
+  values:
+    subhistory: 20
+    rate_model: k
+    ionize_stream: true
+    material: Silicon
+    efield.z: 0.0
 sweep:
-- name: Parameters/lc
+- name: Silicon.efield.x
   values:
-  - 0.005
-  - 0.01
-  - 0.02
+  - 1000.0
+  - 10000.0
+  - 100000.0
   value_type: float
-  label: lc
-- name: Parameters/junction
-  values:
-  - 0.3
-  - 0.5
-  value_type: float
-  label: junction
+  label: Silicon.efield.x
 hidden_rows: []
