@@ -2,3 +2,4 @@ __pycache__/
 input_files/
 template*.json
 *.encore.json
+encore*
