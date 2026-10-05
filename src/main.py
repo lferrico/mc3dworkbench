@@ -1,5 +1,6 @@
 import multiprocessing
 import os
+import shutil
 import sys
 import tempfile
 
@@ -9,6 +10,7 @@ from PySide6.QtWidgets import *
 
 import encore_input
 import geo
+import remote
 import theme
 import tools
 from project import Project, ProjectError, SUFFIX as PROJECT_SUFFIX
@@ -794,18 +796,50 @@ class Workbench(QMainWindow):
         self.pool_input.setCurrentIndex(max(index, 0))
         self.pool_input.blockSignals(False)
 
+    RUN_MARKER = ".encore-run"  # in a results/<row> folder: written by Submit, safe to replace
+
     def submit_all(self):
         """One cluster job per sweep row, so the rows spread over the pools.
 
-        Each row's Generate button turns into that job's progress.
+        Each row's Generate button turns into that job's progress. A project on
+        storage the cluster sees (the NAS) runs in place: every row writes its
+        input to <project>/results/<row>/ and the job writes its output there.
+        Otherwise the rows are uploaded and run in the server's jobs folder.
         """
         if not self.check_runnable():
             return
+        if self.project is None:
+            self.submit_rows(None)
+            return
+        workdir = remote.cluster_path(self.project.directory, self.jobs_panel.path_map())
+        self.jobs_panel.connection.request(
+            "path.check", {"path": workdir},
+            callback=lambda r: self.submit_rows(self.results_root() if r["ok"] else None, r.get("reason")),
+            error=lambda message: self.submit_rows(None, message))
+
+    def results_root(self):
+        return os.path.join(self.project.directory, "results")
+
+    def row_folder(self, root, label):
+        """results/<label>, unless something not written by Submit is there."""
+        folder = os.path.join(root, label)
+        suffix = 2
+        while os.path.exists(folder) and not os.path.exists(os.path.join(folder, self.RUN_MARKER)):
+            folder = os.path.join(root, f"{label}_{suffix}")
+            suffix += 1
+        return folder
+
+    def submit_rows(self, results_root, reason=None):
+        """Submit every row: in place under results_root, or uploaded when None."""
+        if results_root is None and self.project is not None:
+            self.statusBar().showMessage(f"Uploading the runs: {reason}", 15000)
 
         rows = self.grid.rows()
         pool = self.pool_input.currentText()
         pool = None if pool == ANY_POOL else pool
         project = self.project.name if self.project else "sweep"
+        path_map = self.jobs_panel.path_map()
+        busy = []
         progress = QProgressDialog(f"Submitting {len(rows)} sweep points...", "Cancel",
                                    0, len(rows), self)
         progress.setWindowModality(Qt.WindowModal)
@@ -817,22 +851,46 @@ class Workbench(QMainWindow):
                 if progress.wasCanceled():
                     return
                 row_key = self.grid.build_row_key(row_data)
-                name = f"{project}/{self.row_label(row_data) or index + 1}"
-                with tempfile.TemporaryDirectory(prefix="encore-submit-") as directory:
-                    try:
+                current = self.jobs_panel.jobs.get(self.row_jobs.get(row_key))
+                if current is not None and current["state"] in (remote.QUEUED, remote.RUNNING):
+                    # Its folder is in use; resubmitting would delete it mid-run.
+                    busy.append(current["name"])
+                    continue
+                label = self.sanitize_name_token(self.row_label(row_data) or project)
+                meta = {"project": self.project_key(), "row": row_key, "label": label}
+                name = f"{project}/{label}"
+                try:
+                    if results_root is not None:
+                        folder = self.row_folder(results_root, label)
+                        # A rerun of the row replaces its previous results.
+                        shutil.rmtree(folder, ignore_errors=True)
+                        os.makedirs(folder)
+                        open(os.path.join(folder, self.RUN_MARKER), "w").close()
+                        self.write_run(row_data, folder, os.path.join(folder, "mesh.msh"))
+                        remote.map_material_paths(os.path.join(folder, "encore.yaml"), path_map)
+                        self.mark_submitting(row_key)
+                        self.jobs_panel.submit_in_place(remote.cluster_path(folder, path_map), name, pool,
+                                                        done=self.on_job_changed, meta=meta)
+                        continue
+                    with tempfile.TemporaryDirectory(prefix="encore-submit-") as directory:
                         self.write_run(row_data, directory, os.path.join(directory, "mesh.msh"))
-                    except (geo.GeoError, encore_input.InputError) as exc:
-                        QMessageBox.warning(self, "Submit Failed", str(exc))
-                        return
-                    # Files are read while submitting, so the folder may go right after.
-                    self.grid.set_row_status(row_key, {"state": "submitting", "fraction": None,
-                                                       "text": "submitting"})
-                    self.jobs_panel.submit(
-                        os.path.join(directory, "encore.yaml"), name, pool,
-                        done=self.on_job_changed,
-                        meta={"project": self.project_key(), "row": row_key})
+                        # Files are read while submitting, so the folder may go right after.
+                        self.mark_submitting(row_key)
+                        self.jobs_panel.submit(os.path.join(directory, "encore.yaml"), name, pool,
+                                               done=self.on_job_changed, meta=meta)
+                except (geo.GeoError, encore_input.InputError, OSError) as exc:
+                    QMessageBox.warning(self, "Submit Failed", str(exc))
+                    return
         finally:
             progress.setValue(len(rows))
+        if busy:
+            QMessageBox.information(
+                self, "Rows Still Running",
+                "These rows were not resubmitted because their jobs are still queued or "
+                "running. Cancel them first to rerun:\n\n" + "\n".join(busy))
+
+    def mark_submitting(self, row_key):
+        self.grid.set_row_status(row_key, {"state": "submitting", "fraction": None, "text": "submitting"})
 
     def project_key(self):
         """What ties a job to this project on the server (see submit_all).
@@ -893,7 +951,8 @@ class Workbench(QMainWindow):
             text = f"{pool}  {fraction * 100:.0f}%"
             detail = progress_text(job.get("progress"))
         elif state == "done":
-            fraction, text, detail = 1.0, f"{pool}  done", ""
+            fraction, text = 1.0, f"{pool}  done"
+            detail = f"Results in {job['run_dir']}" if job.get("run_dir") else ""
         else:
             fraction, text = None, f"{pool}  {state}" if pool and state != "queued" else state
             detail = job.get("error") or ""

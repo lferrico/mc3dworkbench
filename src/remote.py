@@ -41,6 +41,26 @@ def free_port():
         return s.getsockname()[1]
 
 
+def cluster_path(local, path_map):
+    """The cluster's name for a local path: the first matching `local = cluster`
+    prefix of path_map applied, or the path unchanged (same mount on both)."""
+    local = os.path.abspath(local)
+    for prefix, remote in path_map.items():
+        prefix = prefix.rstrip("/")
+        if prefix and (local == prefix or local.startswith(prefix + "/")):
+            return remote.rstrip("/") + local[len(prefix):]
+    return local
+
+
+def map_material_paths(input_path, path_map):
+    """Point the materials of a written encore.yaml at their cluster paths, in place."""
+    input_path = Path(input_path)
+    doc = yaml.safe_load(input_path.read_text()) or {}
+    for m in doc.get("materials") or []:
+        m["file"] = cluster_path(input_path.parent / m["file"], path_map)
+    input_path.write_text(yaml.safe_dump(doc, sort_keys=False))
+
+
 def prepare_submission(input_path, path_map):
     """Make a written encore.yaml self-contained for the server.
 
@@ -287,6 +307,11 @@ class ServerConnection(QObject):
             return
         self.request("job.submit", {"document": document, "files": names, "name": name,
                                     "pool": pool or None, "meta": meta or {}}, blobs, callback, error)
+
+    def submit_in_place(self, workdir, name, pool, callback=None, error=None, meta=None):
+        """Run the encore.yaml already in workdir (a cluster path) there, uploading nothing."""
+        self.request("job.submit", {"workdir": workdir, "name": name, "pool": pool or None,
+                                    "meta": meta or {}}, (), callback, error)
 
     def fetch_all(self, job_id, directory, done=None, error=None, skip=("job.json",)):
         """Download every file of a job into directory, keeping its layout."""

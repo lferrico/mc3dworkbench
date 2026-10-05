@@ -63,9 +63,10 @@ class ConnectDialog(QDialog):
         form.addRow("Server port", self.gui_port)
         form.addRow("Event port", self.event_port)
         form.addRow("Material paths", self.path_map)
-        hint = QLabel("One `local = cluster` prefix per line. Materials under a mapped "
-                      "directory are used in place on the cluster; any other material is "
-                      "uploaded with its folder.")
+        hint = QLabel("One `local = cluster` prefix per line, for folders both machines see "
+                      "(e.g. the NAS). A project under one runs in place: each sweep row writes "
+                      "to <project>/results/<row>. Paths that are the same on both machines "
+                      "need no line. Anything the cluster cannot see is uploaded.")
         hint.setWordWrap(True)
         form.addRow("", hint)
 
@@ -513,6 +514,13 @@ class JobsPanel(QWidget):
             job["id"], directory,
             done=lambda n: self.status.setText(f"Downloaded {n} files to {directory}"),
             error=self.warn)
+
+    def path_map(self):
+        return path_map_from_settings(self.settings)
+
+    def submit_in_place(self, workdir, name, pool, done=None, meta=None):
+        """Run a job in a folder the cluster sees (workdir: its cluster path)."""
+        self.connection.submit_in_place(workdir, name, pool, callback=done, error=self.warn, meta=meta)
 
     def submit(self, input_path, name, pool, done=None, meta=None):
         """Upload a written encore.yaml as a job. pool None: any idle pool."""
