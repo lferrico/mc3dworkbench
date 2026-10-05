@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 import sys
+import tempfile
 
 from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QActionGroup
@@ -12,8 +13,9 @@ import theme
 import tools
 from project import Project, ProjectError, SUFFIX as PROJECT_SUFFIX
 from values import format_value_for_table, parse_values_input
-from widgets import (CollapsibleSection, EnterKeyButton, GeoPanel, MaterialsPanel,
-                     ParameterGrid, ToolPanel)
+from widgets import (ANY_POOL, CollapsibleSection, EnterKeyButton, GeoPanel, JobsPanel,
+                     MaterialsPanel, ParameterGrid, ToolPanel)
+from widgets.jobs_panel import progress_fraction, progress_text
 
 
 class Workbench(QMainWindow):
@@ -47,6 +49,28 @@ class Workbench(QMainWindow):
 
         self.settings = QSettings("Encore", "Workbench")
         self.theme_name = self.settings.value("theme", theme.SYSTEM_THEME)
+
+        # Cluster: an Encore job server, its pools and jobs, in a dock.
+        self.jobs_panel = JobsPanel(self.settings)
+        self.jobs_panel.connectedChanged.connect(self.on_cluster_connected)
+        self.jobs_panel.connection.poolChanged.connect(self.refresh_pool_input)
+        # Sweep rows submitted as jobs show their progress in the grid.
+        # The server keeps each job's project and row (its meta), so this
+        # survives restarts: reconnecting rebuilds it from the job list.
+        self.row_jobs = {}  # grid row key -> id of its newest job
+        self.jobs_panel.connection.jobChanged.connect(self.on_job_changed)
+        self.jobs_panel.connection.progress.connect(self.on_job_progress)
+        self.jobs_panel.jobsReset.connect(self.on_jobs_reset)
+        self.jobs_dock = QDockWidget("Cluster", self)
+        self.jobs_dock.setObjectName("ClusterDock")
+        self.jobs_dock.setWidget(self.jobs_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.jobs_dock)
+        self.jobs_dock.hide()
+        self.cluster_menu = self.menuBar().addMenu("Cluster")
+        self.cluster_menu.addAction("Connect...", self.connect_cluster)
+        self.cluster_menu.addAction(self.jobs_dock.toggleViewAction())
+        self.jobs_dock.toggleViewAction().setText("Show Jobs")
+
         self.build_theme_menu()
         self.apply_theme()
 
@@ -86,6 +110,18 @@ class Workbench(QMainWindow):
         input_layout.addWidget(self.values_input, 1)
         input_layout.addWidget(self.add_btn)
         input_layout.addWidget(self.generate_btn)
+
+        # Submit the same sweep to the cluster instead of writing it out.
+        self.pool_input = QComboBox()
+        self.pool_input.setToolTip("Pool to run on")
+        self.pool_input.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.submit_btn = EnterKeyButton("Submit")
+        self.submit_btn.setToolTip("Run every sweep point as its own job on the connected cluster")
+        self.submit_btn.clicked.connect(self.submit_all)
+        self.pool_input.setVisible(False)
+        self.submit_btn.setVisible(False)
+        input_layout.addWidget(self.pool_input)
+        input_layout.addWidget(self.submit_btn)
 
         # Project column: materials above geometry.
         self.materials_panel = MaterialsPanel()
@@ -199,6 +235,10 @@ class Workbench(QMainWindow):
             self.restore_sweep(project)
         finally:
             self._loading_project = False
+
+        # Rows of this project that already ran (or still run) on the cluster.
+        if self.jobs_panel.connected:
+            self.on_jobs_reset(self.jobs_panel.jobs)
 
         return True
 
@@ -361,6 +401,7 @@ class Workbench(QMainWindow):
         # A geometry is optional -- a memc run needs no device -- but there is
         # nothing to write without a tool.
         self.generate_btn.setEnabled(bool(self.tools))
+        self.submit_btn.setEnabled(bool(self.tools))
         self.on_variable_selection_changed()
 
     def geometry_names(self):
@@ -646,19 +687,40 @@ class Workbench(QMainWindow):
         QMessageBox.information(self, "Run Written", f"{directory}\n\n{written}{detail}")
 
     def generate_all_meshes(self):
-        rows = self.grid.rows()
-        if not rows:
-            QMessageBox.information(self, "No Rows", "There are no sweep points to run.")
-            return
-
-        if not self.tools:
-            QMessageBox.information(self, "No Tools", "Add a tool before generating.")
+        if not self.check_runnable():
             return
 
         directory = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if not directory:
             return
 
+        written = self.write_sweep(directory)
+        if written is None:
+            return
+
+        sims, meshes = written
+        QMessageBox.information(
+            self, "Input Written",
+            f"encore.yaml with {sims} sim entr{'y' if sims == 1 else 'ies'}"
+            f"{f' and {meshes} mesh(es)' if meshes else ''} under\n{directory}")
+
+    def check_runnable(self):
+        if not self.grid.rows():
+            QMessageBox.information(self, "No Rows", "There are no sweep points to run.")
+            return False
+
+        if not self.tools:
+            QMessageBox.information(self, "No Tools", "Add a tool before generating.")
+            return False
+        return True
+
+    def write_sweep(self, directory):
+        """Write encore.yaml and meshes for every row into directory.
+
+        Returns (sim entries, meshes), or None when cancelled or failed (the
+        failure has been reported).
+        """
+        rows = self.grid.rows()
         progress = QProgressDialog(f"Meshing {len(rows)} sweep points...", "Cancel",
                                    0, len(rows), self)
         progress.setWindowModality(Qt.WindowModal)
@@ -682,7 +744,7 @@ class Workbench(QMainWindow):
                 progress.setLabelText(f"Sweep point {index + 1} of {len(rows)}...")
                 QApplication.processEvents()
                 if progress.wasCanceled():
-                    return
+                    return None
 
                 mesh_name = self.mesh_name(row_data)
                 if with_device and mesh_name not in devices:
@@ -701,15 +763,142 @@ class Workbench(QMainWindow):
         except (geo.GeoError, encore_input.InputError) as exc:
             progress.close()
             QMessageBox.warning(self, "Generate Failed", str(exc))
-            return
+            return None
         finally:
             progress.setValue(len(rows))
 
-        meshes = len(devices)
-        QMessageBox.information(
-            self, "Input Written",
-            f"encore.yaml with {len(sims)} sim entr{'y' if len(sims) == 1 else 'ies'}"
-            f"{f' and {meshes} mesh(es)' if meshes else ''} under\n{directory}")
+        return len(sims), len(devices)
+
+    # --- Cluster -----------------------------------------------------------
+
+    def connect_cluster(self):
+        self.jobs_dock.show()
+        if not self.jobs_panel.connected:
+            self.jobs_panel.toggle_connection()
+
+    def on_cluster_connected(self, connected):
+        self.pool_input.setVisible(connected)
+        self.submit_btn.setVisible(connected)
+        if connected:
+            self.jobs_dock.show()
+            # The pool list arrives right after connecting.
+            QTimer.singleShot(500, self.refresh_pool_input)
+
+    def refresh_pool_input(self, *_):
+        current = self.pool_input.currentText()
+        self.pool_input.blockSignals(True)
+        self.pool_input.clear()
+        self.pool_input.addItem(ANY_POOL)
+        self.pool_input.addItems(self.jobs_panel.pool_names())
+        index = self.pool_input.findText(current)
+        self.pool_input.setCurrentIndex(max(index, 0))
+        self.pool_input.blockSignals(False)
+
+    def submit_all(self):
+        """One cluster job per sweep row, so the rows spread over the pools.
+
+        Each row's Generate button turns into that job's progress.
+        """
+        if not self.check_runnable():
+            return
+
+        rows = self.grid.rows()
+        pool = self.pool_input.currentText()
+        pool = None if pool == ANY_POOL else pool
+        project = self.project.name if self.project else "sweep"
+        progress = QProgressDialog(f"Submitting {len(rows)} sweep points...", "Cancel",
+                                   0, len(rows), self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        try:
+            for index, row_data in enumerate(rows):
+                progress.setValue(index)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    return
+                row_key = self.grid.build_row_key(row_data)
+                name = f"{project}/{self.row_label(row_data) or index + 1}"
+                with tempfile.TemporaryDirectory(prefix="encore-submit-") as directory:
+                    try:
+                        self.write_run(row_data, directory, os.path.join(directory, "mesh.msh"))
+                    except (geo.GeoError, encore_input.InputError) as exc:
+                        QMessageBox.warning(self, "Submit Failed", str(exc))
+                        return
+                    # Files are read while submitting, so the folder may go right after.
+                    self.grid.set_row_status(row_key, {"state": "submitting", "fraction": None,
+                                                       "text": "submitting"})
+                    self.jobs_panel.submit(
+                        os.path.join(directory, "encore.yaml"), name, pool,
+                        done=self.on_job_changed,
+                        meta={"project": self.project_key(), "row": row_key})
+        finally:
+            progress.setValue(len(rows))
+
+    def project_key(self):
+        """What ties a job to this project on the server (see submit_all).
+
+        Without a project file, jobs are followed for this session only.
+        """
+        if self.project:
+            return os.path.abspath(self.project.path)
+        return f"unsaved:{os.getpid()}:{id(self)}"
+
+    def row_job_for(self, job):
+        """The grid row a job was submitted from, if it belongs to this project."""
+        meta = job.get("meta") or {}
+        if meta.get("project") != self.project_key():
+            return None
+        return meta.get("row")
+
+    def on_job_changed(self, job):
+        row_key = self.row_job_for(job)
+        if row_key is None:
+            return
+        current = self.jobs_panel.jobs.get(self.row_jobs.get(row_key))
+        if job.get("deleted"):
+            if current is None or current["id"] == job["id"]:
+                self.row_jobs.pop(row_key, None)
+                self.grid.set_row_status(row_key, None)
+            return
+        # A row follows the newest job submitted from it.
+        if current is not None and current["id"] != job["id"] and \
+                (current.get("submitted") or 0) > (job.get("submitted") or 0):
+            return
+        self.row_jobs[row_key] = job["id"]
+        self.show_row_job(row_key, job)
+
+    def on_jobs_reset(self, jobs):
+        """Rebuild every row's status from the server's job list (after connecting)."""
+        self.row_jobs = {}
+        self.grid.row_status.clear()
+        for job in sorted(jobs.values(), key=lambda j: j.get("submitted") or 0):
+            row_key = self.row_job_for(job)
+            if row_key is not None:
+                self.row_jobs[row_key] = job["id"]
+        self.grid.refresh_grid()
+        for row_key, job_id in self.row_jobs.items():
+            self.show_row_job(row_key, jobs[job_id])
+
+    def on_job_progress(self, job_id, progress):
+        job = self.jobs_panel.jobs.get(job_id)
+        row_key = self.row_job_for(job) if job else None
+        if row_key is not None and self.row_jobs.get(row_key) == job_id:
+            self.show_row_job(row_key, job)
+
+    def show_row_job(self, row_key, job):
+        state = job["state"]
+        pool = job.get("assigned") or job.get("pool") or ""
+        if state == "running":
+            fraction = progress_fraction(job.get("progress")) or 0.0
+            text = f"{pool}  {fraction * 100:.0f}%"
+            detail = progress_text(job.get("progress"))
+        elif state == "done":
+            fraction, text, detail = 1.0, f"{pool}  done", ""
+        else:
+            fraction, text = None, f"{pool}  {state}" if pool and state != "queued" else state
+            detail = job.get("error") or ""
+        self.grid.set_row_status(row_key, {"state": state, "fraction": fraction, "text": text,
+                                           "detail": f"{job['name']} ({job['id']})\n{detail}".strip()})
 
     def unique_mesh_path(self, directory, base_name):
         candidate = os.path.join(directory, f"{base_name}.msh")
@@ -772,6 +961,10 @@ def main(argv):
     arguments = [a for a in argv[1:] if not a.startswith("-")]
     if arguments:
         window.open_project_file(os.path.abspath(arguments[0]))
+
+    # Back to the cluster if it was connected at the last close; the job list
+    # it sends restores each row's progress.
+    window.jobs_panel.reconnect_on_start()
 
     return app.exec()
 

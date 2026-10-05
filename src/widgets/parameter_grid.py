@@ -17,6 +17,9 @@ class ParameterGrid(QTableWidget):
     every combination of those values as a row, merges repeated cells, and lets
     the user edit values, reorder columns by dragging, and remove rows.
 
+    A row given a run status (set_row_status) shows a progress bar in place of
+    its Generate button, e.g. while that sweep point runs as a cluster job.
+
     Signals:
         gridChanged           parameters, values, column order or hidden rows changed
         rowExportRequested    the action button on a row was clicked (arg: row dict)
@@ -29,6 +32,7 @@ class ParameterGrid(QTableWidget):
         super().__init__(parent)
         self.parameters = []
         self.hidden_row_keys = set()
+        self.row_status = {}  # row key -> {"state", "fraction", "text", "detail"}
         self.current_grid_data = []
         self.column_patterns = []
         self._refreshing_table = False
@@ -81,6 +85,26 @@ class ParameterGrid(QTableWidget):
         """The visible rows, each a {parameter name: value} dict."""
         return [dict(row_data) for row_data in self.current_grid_data]
 
+    def set_row_status(self, row_key, status):
+        """Show a run status on a row (None goes back to its Generate button).
+
+        status: {"state": str, "fraction": float or None, "text": str, "detail": str}.
+        Rows are matched by build_row_key, so a status survives column reorders.
+        """
+        if status is None:
+            self.row_status.pop(row_key, None)
+        else:
+            self.row_status[row_key] = status
+        for r, row_data in enumerate(self.current_grid_data):
+            if self.build_row_key(row_data) == row_key:
+                self.set_action_cell(r, row_data)
+                self.fit_action_column()
+                return
+
+    def clear_row_status(self):
+        self.row_status.clear()
+        self.refresh_grid()
+
     # --- Context menus ------------------------------------------------------
 
     def show_table_context_menu(self, pos):
@@ -98,6 +122,7 @@ class ParameterGrid(QTableWidget):
 
         menu = QMenu(self)
         edit_action = menu.addAction("Edit values")
+        clear_status_action = menu.addAction("Clear run status") if self.row_status else None
         remove_row_action = None
         if row is not None and 0 <= row < len(self.current_grid_data):
             remove_row_action = menu.addAction("Remove this row")
@@ -106,7 +131,11 @@ class ParameterGrid(QTableWidget):
         remove_action = menu.addAction(f"Remove '{param.get('label') or param['name']}'")
         selected_action = menu.exec(global_pos)
 
-        if selected_action == edit_action:
+        if selected_action is None:
+            return
+        if selected_action == clear_status_action:
+            self.clear_row_status()
+        elif selected_action == edit_action:
             self.edit_parameter_values(col)
         elif selected_action == remove_row_action:
             self.remove_row(row)
@@ -342,36 +371,65 @@ class ParameterGrid(QTableWidget):
 
             self.apply_row_spans(visible_grid_data)
 
-            for r in range(len(visible_grid_data)):
-                btn = EnterKeyButton("Generate")
-                btn.setProperty("class", "cell")
-                # Its font comes from the stylesheet, which is only resolved on
-                # polish -- measuring before that gives the wrong width.
-                btn.ensurePolished()
-                node_data = visible_grid_data[r]
-                btn.clicked.connect(lambda chk=False, d=dict(node_data): self.rowExportRequested.emit(d))
-                self.setCellWidget(r, len(self.parameters), btn)
-
             self.current_grid_data = [dict(row_data) for row_data in visible_grid_data]
+            for r, row_data in enumerate(self.current_grid_data):
+                self.set_action_cell(r, row_data)
 
             # Parameter columns share the width; the action column only needs
-            # to fit its button. A styled button's sizeHint can fall a few px
-            # short of what its padding actually needs, which clips the label,
-            # so the column is set from the button plus a margin.
+            # to fit its widget.
             action_column = len(self.parameters)
             header = self.horizontalHeader()
             header.setSectionResizeMode(QHeaderView.Stretch)
             header.setSectionResizeMode(action_column, QHeaderView.Fixed)
-
-            button = self.cellWidget(0, action_column)
-            if button is None:
-                width = self.sizeHintForColumn(action_column)
-            else:
-                # A styled QPushButton reports a sizeHint that does not cover
-                # its QSS padding, so the label gets clipped. Measure the text.
-                button.ensurePolished()
-                text_width = button.fontMetrics().horizontalAdvance(button.text())
-                width = text_width + 5 * theme.SPACING_SM
-            self.setColumnWidth(action_column, width)
+            self.fit_action_column()
         finally:
             self._refreshing_table = False
+
+    def set_action_cell(self, r, row_data):
+        """The row's Generate button, or its run status when it has one."""
+        action_column = len(self.parameters)
+        status = self.row_status.get(self.build_row_key(row_data))
+        widget = self.cellWidget(r, action_column)
+        if status is None:
+            if isinstance(widget, EnterKeyButton):
+                return
+            btn = EnterKeyButton("Generate")
+            btn.setProperty("class", "cell")
+            # Its font comes from the stylesheet, which is only resolved on
+            # polish -- measuring before that gives the wrong width.
+            btn.ensurePolished()
+            btn.clicked.connect(lambda chk=False, d=dict(row_data): self.rowExportRequested.emit(d))
+            self.setCellWidget(r, action_column, btn)
+            return
+
+        if not isinstance(widget, QProgressBar):
+            widget = QProgressBar()
+            widget.setTextVisible(True)
+            widget.setAlignment(Qt.AlignCenter)
+            self.setCellWidget(r, action_column, widget)
+        fraction = status.get("fraction")
+        if fraction is None:
+            # Queued, failed or cancelled: an empty bar that only carries text.
+            widget.setRange(0, 1000)
+            widget.setValue(0)
+        else:
+            widget.setRange(0, 1000)
+            widget.setValue(int(max(0.0, min(1.0, fraction)) * 1000))
+        widget.setFormat(status.get("text", ""))
+        widget.setToolTip(status.get("detail", ""))
+
+    def fit_action_column(self):
+        """Fit the action column to a Generate button, or wider for progress bars."""
+        action_column = len(self.parameters)
+        widget = next((self.cellWidget(r, action_column) for r in range(self.rowCount())
+                       if isinstance(self.cellWidget(r, action_column), EnterKeyButton)), None)
+        if widget is None:
+            width = self.sizeHintForColumn(action_column)
+        else:
+            # A styled QPushButton reports a sizeHint that does not cover its
+            # QSS padding, so the label would get clipped. Measure the text.
+            widget.ensurePolished()
+            width = widget.fontMetrics().horizontalAdvance(widget.text()) + 5 * theme.SPACING_SM
+        if self.row_status:
+            width = max(width, 18 * theme.SPACING_SM)
+        self.setColumnWidth(action_column, width)
